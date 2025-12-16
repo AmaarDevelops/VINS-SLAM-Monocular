@@ -3,6 +3,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation
+import time
+
+
+prev_time = 0.0  # Tracks the timestamp of the last tracked frame
+prev_velocity = np.zeros(3) # Tracks the camera's velocity in world coordinates (m/s)
 
 
 
@@ -145,6 +150,101 @@ class SLAM_Map:
         self.point_cloud.append(points_w)
 
 
+class IMU_Data:
+    def __init__(self):
+        # Linear acceleration in X,Y,Z (m/s^2) - includes gravity
+        self.acceleration = np.zeros(3)
+
+        # Angular velocity (rate of rotation) in X,Y,Z (rad/s)
+        self.angular_velocity = np.zeros(3)
+
+
+# -- IMU Data Generator --
+imu_sim_time = 0.0 # Global tracker for simulation time
+
+
+def generate_imu_reading(dt):
+
+    # Simulates synthetic IMU data for a gentle, controlled movement.
+    # What: Simulates the sensor data.
+    # Why: A real system reads this from a sensor; we fake it to test fusion logic.
+
+    global imu_sim_time
+    imu_sim_time += dt
+
+    imu_data = IMU_Data()
+
+    # Simulate constant gravity (Why: All real IMUs measure 9.81m/s^2 downwards)
+
+    imu_data.acceleration[1] = -9.81
+
+    # Simulate forward / backward movement (Why: To simulate non-zero linear motion)
+    # Gentle sine wave movement along the camera's Z-axis (forward direction)
+
+    imu_data.acceleration[2] += 0.25 * np.sin(imu_sim_time * 0.5)
+
+    # Simulate Noise / Jitter (All real sensors have noise)
+    # Small random noise added to angular velocity (rate of rotation)
+
+    imu_data.angular_velocity[0] = 0.001 * np.random.randn()
+    imu_data.angular_velocity[1] = 0.001 * np.random.randn()
+
+
+    return imu_data
+
+
+# --- This function takes the VO result (R,t) and the IMU (sensor) reading, integrates the IMU to find the true scale, and applied it to the VO
+
+def fuse_visual_and_intertial(R_vo,t_vo,imu_data,dt,prev_velocity,R_global):
+    """
+    Fuses the Visual Odometry (VO) pose with the Inertial Measurement Unit (IMU) data.
+
+    The primary goal is to establish the metric scale (s) of the VO translation vector.
+
+    Returns: R_fused, t_fused (now with metric scale), current_velocity
+    """
+
+    # --- 1. IMU Motion Integration (What: Estimate Distance Traveled from Acceleration) ---
+
+    # Remove gravity (What: Only want acceleration from movement, not gravity pull)
+    # The IMU data already includes -9.81 on the Y-axis (from the generator).
+
+    prev_velocity = np.zeros(3)
+
+    a_motion = imu_data.acceleration
+    a_motion[1] += 9.81 # Correct for gravity bias
+
+    # Velocity update (Why: Necessary to find position. V_new = V_old + a * dt)
+    # We must rotate acceleration from the camera frame to the world frame using the VO rotation (R_vo)
+
+    a_world = R_global @ a_motion
+
+    delta_v = a_world * dt
+    current_velocity = prev_velocity + delta_v
+
+    # Position update (Why : this gives us the distance travelled in meters. P_new = P_old + V * dt)
+    delta_t_imu = current_velocity * dt
+
+    # ---------------------------- Scale Estimation ---------------------
+
+    # The magnitude of the IMU translation (|delte_t_imu|) is the True Metric
+    scale_imu = np.linalg.norm(delta_t_imu)
+
+    # The magnitude of VO translation (|t_vo|) is the visual, unit-less distance.
+    scale_vo = np.linalg.norm(t_vo)
+
+    # Scale factor : (Why : this is metric conversion factor for the visual data)
+
+    # --- Protection against zero division ---
+    if scale_vo < 1e-6 or scale_imu < 1e-6:
+        t_fused = t_vo * 0.001
+    else:
+        scale_factor = scale_imu / scale_vo
+        t_fused = t_vo * scale_factor
+
+    R_fused = R_vo
+
+    return R_fused,t_fused,current_velocity
 
 
 
@@ -174,16 +274,24 @@ def pose_estimation():
 
     init_3d_plot()
 
+
+    # ----------- VINS Setup , initalize velocity and timing tracking  -------
+    prev_time = time.time()
+    prev_velocity = np.zeros(3)
+
+
+
     # --- Find distinct landmarks / features in the frame / image
 
     def get_tracking_points(image_gray):
         points = cv2.goodFeaturesToTrack(
             image_gray,
             maxCorners=2000,
-            qualityLevel=0.05,
+            qualityLevel=0.15,
             minDistance=7,
             blockSize=7
         )
+
         if points is None:
             return None
 
@@ -232,6 +340,22 @@ def pose_estimation():
         ret, frame = cap.read()
         if not ret: break
 
+        # ------ Timing and IMU Data Generation -----
+        # What: Calculate the time difference between frames (dt).
+        # Why: All physical laws (P = V*t, V = A*t) rely on accurate time steps.
+
+        current_time = time.time()
+        dt = current_time - prev_time
+        prev_time = current_time # Update forthe next frame
+
+        # What: Get the simulated IMU reading for this time step.
+        # Why: This simulates reading the acceleration and angular velocity sensors.
+
+        imu_reading = generate_imu_reading(dt)
+
+
+
+
         current_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if prev_frame is None:
@@ -261,8 +385,9 @@ def pose_estimation():
             prev_frame = current_frame_gray
             continue # MUST continue if re-initialized
 
-        # The lucas kanade finds quicky where each landmark moved from previous frame to next (current) one
+        # The lucas kanade finds quicky where each landmark (feature) moved from previous frame to next (current) one
         # 2b. Perform Tracking
+
         current_keypoints, status, err = cv2.calcOpticalFlowPyrLK(
             prev_frame, current_frame_gray, prev_keypoints, None, **LK_PARAMS
         )
@@ -282,6 +407,7 @@ def pose_estimation():
             prev_keypoints = new_points
             prev_frame = current_frame_gray
             continue # MUST continue if tracking failed
+        
 
         # 2d. Filter and Check Point Count
         good_new = current_keypoints[status_mask]
@@ -289,16 +415,34 @@ def pose_estimation():
 
         if len(good_new) < 8:
             print(f"Not enough points ({len(good_new)}) for reliable pose estimation. Re-detecting...")
-            new_points = get_tracking_points(current_frame_gray)
 
-            if new_points is None:
-                prev_frame = current_frame_gray
-                prev_keypoints = None
+            relocalized = False
+
+            if len(slam_map.keyframe_images) >= 5:
+                for i in range(len(slam_map.keyframe_images)):
+                    matched_index =  detect_loop(
+                        current_frame_gray,
+                        slam_map.keyframe_images[i],
+                        slam_map.keyframe_indices[i]
+                    )
+
+                    if matched_index is not None:
+                        print(f"*** Relocalization SUCCESS! Matched to Keyframe {matched_index} ***")
+
+                        new_points = get_tracking_points(slam_map.keyframe_images[i])
+
+                        if new_points is not None:
+                            prev_keypoints = new_points
+                            prev_frame = current_frame_gray
+                            relocalized = True
+                            break
+
+            if relocalized:
                 continue
 
-            prev_keypoints = new_points
-            prev_frame = current_frame_gray
-            continue # MUST continue if point count is too low
+            print('Relocalization failed. re-detecting features')
+            new_points = get_tracking_points(current_frame_gray)
+
 
 
 
@@ -324,12 +468,15 @@ def pose_estimation():
             slam_map.keyframe_indices[i]
             )
 
+
             if matched_index is not None:
             # --- CORRECTION LOGIC ---
             # For simplicity, we only print the correction. A full correction requires optimization (PnP/BA).
                 print(f"*** Loop Closure Successful! Correcting path from index {matched_index} onwards... ***")
             # In a real system, you would trigger a pose-graph optimization here.
             # Example: slam_map.correct_pose(matched_index, R, t)
+                t_fused = t_fused * 0.90 # Apply a 10% reduction in movement magnitude
+                loop_closed = True
                 break
 
 
@@ -352,13 +499,26 @@ def pose_estimation():
         # that results in points having a positive depth (meaning they are in front of the camera).
         _, R, t, mask_pose = cv2.recoverPose(E, good_new, good_prev, K, mask=mask_E)
 
-        scale = np.linalg.norm(t)
+        # What: Call the fusion function.
+        # Why: This uses IMU data (acceleration integrated twice) to calculate the true metric scale,
+        #      then rescales the visual translation (t).
 
-        if scale < 1e-6 or np.isnan(scale):
-            print('Warning. Scale collapsed')
-            t = t * 0.1
+        R_global = slam_map.camera_pose[:3,:3]
 
-        slam_map.update_pose(R,t)
+        R_fused,t_fused,current_velocity = fuse_visual_and_intertial(R,t,imu_reading,dt,prev_velocity,R_global)
+
+        if 'loop_closed' in locals() and loop_closed:
+            t_fused = t_fused * 0.90
+
+        # What: Update the map with the fused, metric pose.
+        # Why: The map now reflects real meters, not arbitrary units.
+        slam_map.update_pose(R_fused,t_fused)
+
+        # What: Update global velocity tracking for the next frame.
+        # Why: Needed for the next IMU integration step (V_new becomes V_old).
+
+        prev_velocity = current_velocity
+
 
         # --- 3d world mapping with Triangulization
         mask_good = mask_E.ravel() == 1
@@ -380,7 +540,7 @@ def pose_estimation():
             P1 = K @ np.hstack((np.eye(3), np.zeros((3,1))))
 
             # P2 : The second camera (current_frame) is defined by its calculated R and T
-            P2 = K @ np.hstack((R,t))
+            P2 = K @ np.hstack((R_fused,t_fused))
 
 
             # 2. Triangulate the 3D points
@@ -412,6 +572,7 @@ def pose_estimation():
 
         cv2.putText(img,f'Avg Z depth (MAP) : {avg_z:.2f}',(10,130),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),1)
 
+        cv2.putText(img, f"T_FUSED: [{t_fused[0,0]:.2f}, {t_fused[1,0]:.2f}, {t_fused[2,0]:.2f}]", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         mask = np.zeros_like(frame)
 
